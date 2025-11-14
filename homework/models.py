@@ -29,11 +29,13 @@ class MLPPlanner(nn.Module):
         out_dim = 2 * n_waypoints     # (x,y) for each waypoint
 
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
+            nn.Linear(in_dim, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),
+            nn.Linear(256, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, out_dim),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, out_dim),
         )
 
     def forward(
