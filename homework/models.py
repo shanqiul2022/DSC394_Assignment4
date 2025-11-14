@@ -13,28 +13,27 @@ class MLPPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
+        hidden: int = 128,
     ):
         """
         Args:
             n_track (int): number of points in each side of the track
             n_waypoints (int): number of waypoints to predict
+            hidden (int): hidden width of the MLP
         """
         super().__init__()
-
         self.n_track = n_track
         self.n_waypoints = n_waypoints
 
-        # Each side: (n_track, 2) => 2 * n_track features
-        # Two sides: left + right => 4 * n_track features total
-        in_dim = 4 * n_track
-        out_dim = 2 * n_waypoints  # (x, y) for each waypoint
+        in_dim = 4 * n_track          # left (n_track,2) + right (n_track,2) => 4*n_track scalars
+        out_dim = 2 * n_waypoints     # (x,y) for each waypoint
 
         self.net = nn.Sequential(
-            nn.Linear(in_dim, 128),
+            nn.Linear(in_dim, hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 128),
+            nn.Linear(hidden, hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(128, out_dim),
+            nn.Linear(hidden, out_dim),
         )
 
     def forward(
@@ -56,21 +55,15 @@ class MLPPlanner(nn.Module):
         Returns:
             torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
         """
-        # track_left/right: (B, n_track, 2) -> (B, 2 * n_track)
         B = track_left.shape[0]
+        x_left = track_left.reshape(B, -1)    # (B, 2*n_track)
+        x_right = track_right.reshape(B, -1)  # (B, 2*n_track)
+        x = torch.cat([x_left, x_right], dim=-1)  # (B, 4*n_track)
 
-        left_flat = track_left.reshape(B, -1)
-        right_flat = track_right.reshape(B, -1)
-
-        # Concatenate along feature dimension: (B, 4 * n_track)
-        x = torch.cat([left_flat, right_flat], dim=-1)
-
-        # Pass through MLP: (B, 2 * n_waypoints)
-        out = self.net(x)
-
-        # Reshape to (B, n_waypoints, 2)
-        out = out.view(B, self.n_waypoints, 2)
+        out = self.net(x)                          # (B, 2*n_waypoints)
+        out = out.view(B, self.n_waypoints, 2)     # (B, n_waypoints, 2)
         return out
+
 
 class TransformerPlanner(nn.Module):
     def __init__(
