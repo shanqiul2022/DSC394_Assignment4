@@ -112,6 +112,9 @@ def train(args):
     model = MLPPlanner(n_track=10, n_waypoints=3).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
+    best_val_l1 = float("inf")
+    best_path = None
+
     # Training loop
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -142,15 +145,18 @@ def train(args):
 
         # Validation
         val_metrics = evaluate(model, val_loader, device)
+        val_l1 = val_metrics["l1_error"]
         print(
-            f"  [VAL] L1={val_metrics['l1_error']:.4f}, "
+            f"  [VAL] L1={val_l1:.4f}, "
             f"Longitudinal={val_metrics['longitudinal_error']:.4f}, "
             f"Lateral={val_metrics['lateral_error']:.4f}"
         )
 
     # Save model weights so the grader can load them
-    save_path = save_model(model)
-    print(f"✅ Model saved to: {save_path}")
+    if val_l1 < best_val_l1:
+            best_val_l1 = val_l1
+    best_path = save_model(model)
+    print(f" Model saved to: {best_path}")
 
 
 def main():
