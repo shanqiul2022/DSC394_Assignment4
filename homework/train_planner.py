@@ -1,28 +1,39 @@
 """
 Usage:
-    python3 -m homework.train_planner --your_args here
+    python3 -u -m homework.train_planner --epochs 20 --batch_size 64 --lr 1e-3 --data_root ./drive_data
 """
 import argparse
+from pathlib import Path
+import random
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 
 from homework.models import MLPPlanner, save_model
 from homework.metrics import PlannerMetric
-from homework.datasets.road_dataset import RoadDataset  
+from homework.datasets.road_dataset import RoadDataset
+
+
+def set_seed(seed: int = 1337):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
 
 def masked_l1_loss(preds, targets, mask):
     """
     Computes the masked L1 loss.
     Args:
-        preds: (B, n_waypoints, 2)
+        preds:   (B, n_waypoints, 2)
         targets: (B, n_waypoints, 2)
-        mask: (B, n_waypoints)
+        mask:    (B, n_waypoints)  (bool or 0/1)
     """
-    l1 = torch.abs(preds - targets)  # (B, n_waypoints, 2)
-    mask = mask.unsqueeze(-1)        # (B, n_waypoints, 1)
-    l1 = l1 * mask                   # zero-out invalid waypoints
+    l1 = torch.abs(preds - targets)        # (B, n_waypoints, 2)
+    mask = mask.unsqueeze(-1).float()      # (B, n_waypoints, 1)
+    l1 = l1 * mask                         # zero-out invalid waypoints
     valid = mask.sum()
     loss = l1.sum() / (valid + 1e-8)
     return loss
@@ -47,17 +58,55 @@ def evaluate(model, loader, device):
     return results
 
 
+def _episodes_under(split_dir: Path):
+    """
+    Return a list of episode directories under split_dir (those that contain info.npz).
+    Also supports the case where split_dir itself is a single episode dir with info.npz.
+    """
+    if (split_dir / "info.npz").exists():
+        return [split_dir]
+
+    eps = sorted([p for p in split_dir.iterdir() if (p / "info.npz").exists()])
+    return eps
+
+
+def _load_split_as_dataset(split_dir: Path):
+    """
+    Build a dataset for a split by concatenating per-episode RoadDataset instances.
+    If only a single episode exists, just return that dataset directly.
+    """
+    episodes = _episodes_under(split_dir)
+    if len(episodes) == 0:
+        raise FileNotFoundError(
+            f"No episodes found in {split_dir}. "
+            f"Expected subfolders like {split_dir}/000001/info.npz"
+        )
+    if len(episodes) == 1:
+        return RoadDataset(str(episodes[0])), 1
+
+    ds_list = [RoadDataset(str(ep)) for ep in episodes]
+    return ConcatDataset(ds_list), len(ds_list)
+
 def train(args):
-    """Train the MLPPlanner model."""
+    set_seed(1337)
     device = torch.device(args.device)
     print(f"Using device: {device}")
 
-    # Load dataset
-    train_ds = RoadDataset(split="train", transform="default")
-    val_ds = RoadDataset(split="val", transform="default")
+    # Resolve project root ( .../DSC394_Assignment4 )
+    ROOT = Path(__file__).resolve().parents[1]
+    data_root = (ROOT / args.data_root).resolve()
+    train_dir = data_root / "train"
+    val_dir = data_root / "val"
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=2)
+    # Build datasets
+    train_ds, n_train_eps = _load_split_as_dataset(train_dir)
+    val_ds, n_val_eps = _load_split_as_dataset(val_dir)
+    print(f"Train episodes: {n_train_eps}, Val episodes: {n_val_eps}")
+    print(f"Train samples:  {len(train_ds)} | Val samples: {len(val_ds)}")
+
+    # DataLoader (num_workers=0 is safest in Colab for custom datasets)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # Model + optimizer
     model = MLPPlanner(n_track=10, n_waypoints=3).to(device)
@@ -71,10 +120,10 @@ def train(args):
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
         for batch in pbar:
-            track_left = batch["track_left"].to(device)
-            track_right = batch["track_right"].to(device)
-            waypoints = batch["waypoints"].to(device)
-            waypoints_mask = batch["waypoints_mask"].to(device)
+            track_left = batch["track_left"].to(device)          # (B, 10, 2)
+            track_right = batch["track_right"].to(device)        # (B, 10, 2)
+            waypoints = batch["waypoints"].to(device)            # (B, 3, 2)
+            waypoints_mask = batch["waypoints_mask"].to(device)  # (B, 3)
 
             preds = model(track_left=track_left, track_right=track_right)
             loss = masked_l1_loss(preds, waypoints, waypoints_mask)
@@ -99,7 +148,7 @@ def train(args):
             f"Lateral={val_metrics['lateral_error']:.4f}"
         )
 
-    # Save model weights
+    # Save model weights so the grader can load them
     save_path = save_model(model)
     print(f"✅ Model saved to: {save_path}")
 
@@ -114,9 +163,14 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="device to use (cuda or cpu)"
     )
+    parser.add_argument(
+        "--data_root", type=str, default="drive_data",
+        help="relative path (under project root) that contains train/ and val/ (e.g., ./drive_data)"
+    )
     args = parser.parse_args()
     train(args)
 
 
 if __name__ == "__main__":
     main()
+
