@@ -155,9 +155,10 @@ def train(args):
     # Save model weights so the grader can load them
     if val_l1 < best_val_l1:
             best_val_l1 = val_l1
-    best_path = save_model(model)
-    print(f" Model saved to: {best_path}")
-
+            best_path = save_model(model)
+            print(f" Model saved to: {best_path}")
+        
+    print(f"Best val L1={best_val_l1:.4f}, model at: {best_path}")
 
 def main():
     parser = argparse.ArgumentParser(description="Train MLP Planner (Assignment 4 Part 1a)")
