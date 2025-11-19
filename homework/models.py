@@ -73,13 +73,47 @@ class TransformerPlanner(nn.Module):
         n_track: int = 10,
         n_waypoints: int = 3,
         d_model: int = 64,
+        n_heads: int = 4,
+        num_layers: int = 2,
+        dim_ff: int = 128,
     ):
+        """
+        A Perceiver-style transformer that uses learned waypoint queries to attend
+        over the lane boundary points.
+
+        Args:
+            n_track (int): number of points per side of the track
+            n_waypoints (int): number of waypoints to predict
+            d_model (int): transformer embedding dimension
+            n_heads (int): number of attention heads
+            num_layers (int): number of cross-attention blocks
+            dim_ff (int): hidden size of the feed-forward networks
+        """
         super().__init__()
 
         self.n_track = n_track
         self.n_waypoints = n_waypoints
+        self.d_model = d_model
 
+        # Embed each (x, y) lane point into d_model
+        self.track_proj = nn.Linear(2, d_model)
+
+        # Learned query embeddings for each waypoint (the "latent array")
         self.query_embed = nn.Embedding(n_waypoints, d_model)
+
+        # Cross-attention blocks: queries = waypoints, keys/values = lane points
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=d_model,
+                nhead=n_heads,
+                dim_feedforward=dim_ff,
+                batch_first=True,  # (B, L, D) instead of (L, B, D)
+            )
+            for _ in range(num_layers)
+        ])
+
+        # Final head: project each query embedding to (x, y) waypoint
+        self.output_head = nn.Linear(d_model, 2)
 
     def forward(
         self,
@@ -90,17 +124,49 @@ class TransformerPlanner(nn.Module):
         """
         Predicts waypoints from the left and right boundaries of the track.
 
-        During test time, your model will be called with
-        model(track_left=..., track_right=...), so keep the function signature as is.
-
         Args:
-            track_left (torch.Tensor): shape (b, n_track, 2)
-            track_right (torch.Tensor): shape (b, n_track, 2)
+            track_left (torch.Tensor): shape (B, n_track, 2)
+            track_right (torch.Tensor): shape (B, n_track, 2)
 
         Returns:
-            torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
+            torch.Tensor: future waypoints with shape (B, n_waypoints, 2)
         """
-        raise NotImplementedError
+        B, n_track, _ = track_left.shape
+        assert n_track == self.n_track, f"Expected n_track={self.n_track}, got {n_track}"
+
+        # 1. Combine left and right lane points into a single sequence
+        #    shape: (B, 2*n_track, 2)
+        lane_points = torch.cat([track_left, track_right], dim=1)
+
+        # 2. Project (x, y) → d_model
+        #    shape: (B, 2*n_track, d_model)
+        lane_feats = self.track_proj(lane_points)
+
+        # 3. Build the waypoint queries from the learned embedding
+        #    query_embed.weight: (n_waypoints, d_model)
+        #    queries: (B, n_waypoints, d_model)
+        queries = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
+
+        # 4. Run transformer encoder layers on the queries, using cross-attention
+        #    by concatenating queries and lane_feats, and then taking only the
+        #    query positions as the "latent array" (Perceiver-style).
+        #
+        #    input_seq: (B, n_waypoints + 2*n_track, d_model)
+        input_seq = torch.cat([queries, lane_feats], dim=1)
+
+        # We only care about the first n_waypoints positions after encoding
+        for layer in self.layers:
+            input_seq = layer(input_seq)
+
+        # 5. Take the first n_waypoints positions as the updated queries
+        #    shape: (B, n_waypoints, d_model)
+        updated_queries = input_seq[:, :self.n_waypoints, :]
+
+        # 6. Project to (x, y) for each waypoint
+        #    shape: (B, n_waypoints, 2)
+        out = self.output_head(updated_queries)
+        return out
+
 
 
 class CNNPlanner(torch.nn.Module):
