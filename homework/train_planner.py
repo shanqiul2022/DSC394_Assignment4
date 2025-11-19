@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, ConcatDataset
 from tqdm import tqdm
 
-from homework.models import MLPPlanner, save_model
+from homework.models import MODEL_FACTORY, save_model
 from homework.metrics import PlannerMetric
 from homework.datasets.road_dataset import RoadDataset
 
@@ -109,7 +109,8 @@ def train(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
     # Model + optimizer
-    model = MLPPlanner(n_track=10, n_waypoints=3).to(device)
+    ModelCls = MODEL_FACTORY[args.model]
+    model = ModelCls(n_track=10, n_waypoints=3).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     best_val_l1 = float("inf")
@@ -173,6 +174,12 @@ def main():
     parser.add_argument(
         "--data_root", type=str, default="drive_data",
         help="relative path (under project root) that contains train/ and val/ (e.g., ./drive_data)"
+    )
+    parser.add_argument(
+    "--model", type=str,
+    default="mlp_planner",
+    choices=["mlp_planner", "transformer_planner"],
+    help="which planner model to train"
     )
     args = parser.parse_args()
     train(args)
