@@ -125,7 +125,6 @@ class TransformerPlanner(nn.Module):
 
         # (1) Combine lane boundaries
         lane = torch.cat([track_left, track_right], dim=1)
-        lane = self.input_norm(lane)
         lane = self.track_proj(lane)
 
         # add positional encodings
