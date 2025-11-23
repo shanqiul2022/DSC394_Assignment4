@@ -72,10 +72,10 @@ class TransformerPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        d_model: int = 64,
-        n_heads: int = 4,
-        num_layers: int = 2,
-        dim_ff: int = 128,
+        d_model: int = 128,
+        n_heads: int = 8,
+        num_layers: int = 4,
+        dim_ff: int = 256,
     ):
         """
         A Perceiver-style transformer that uses learned waypoint queries to attend
@@ -95,79 +95,103 @@ class TransformerPlanner(nn.Module):
         self.n_waypoints = n_waypoints
         self.d_model = d_model
 
+        # normalize coordinates slightly
+        self.input_norm = nn.LayerNorm(2)
+        self.norm_in = self.input_norm
+
         # Embed each (x, y) lane point into d_model
         self.track_proj = nn.Linear(2, d_model)
-
+        self.lane_proj = self.track_proj
+        # Positional embeddings for lane points (2 * n_track positions)
+        self.lane_pos_embed = nn.Embedding(2 * n_track, d_model)
         # Learned query embeddings for each waypoint (the "latent array")
         self.query_embed = nn.Embedding(n_waypoints, d_model)
 
-        # Cross-attention blocks: queries = waypoints, keys/values = lane points
+        # Cross-attention blocks
         self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=d_model,
-                nhead=n_heads,
-                dim_feedforward=dim_ff,
-                batch_first=True,  # (B, L, D) instead of (L, B, D)
-            )
-            for _ in range(num_layers)
+            CrossAttnBlock(d_model, n_heads, dim_ff),
+            *[
+                TransformerBlock(d_model, n_heads, dim_ff)
+                for _ in range(num_layers - 1)
+            ]
         ])
 
         # Final head: project each query embedding to (x, y) waypoint
         self.output_head = nn.Linear(d_model, 2)
 
-    def forward(
-        self,
-        track_left: torch.Tensor,
-        track_right: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Predicts waypoints from the left and right boundaries of the track.
-
-        Args:
-            track_left (torch.Tensor): shape (B, n_track, 2)
-            track_right (torch.Tensor): shape (B, n_track, 2)
-
-        Returns:
-            torch.Tensor: future waypoints with shape (B, n_waypoints, 2)
-        """
+    def forward(self, track_left, track_right, **kwargs):
         B, n_track, _ = track_left.shape
         assert n_track == self.n_track, f"Expected n_track={self.n_track}, got {n_track}"
 
-        # 1. Combine left and right lane points into a single sequence
-        #    shape: (B, 2*n_track, 2)
-        lane_points = torch.cat([track_left, track_right], dim=1)
+        # (1) Combine lane boundaries
+        lane = torch.cat([track_left, track_right], dim=1)
+        lane = self.input_norm(lane)
+        lane = self.track_proj(lane)
 
-        # 2. Project (x, y) → d_model
-        #    shape: (B, 2*n_track, d_model)
-        lane_feats = self.track_proj(lane_points)
+        # add positional encodings
+        pos_idx = torch.arange(lane.size(1), device=lane.device)
+        lane = lane + self.lane_pos_embed(pos_idx)[None, :, :]
 
-        # 3. Build the waypoint queries from the learned embedding
-        #    query_embed.weight: (n_waypoints, d_model)
-        #    queries: (B, n_waypoints, d_model)
+        # (2) Build queries
         queries = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
+        
+        # (4) First layer: cross-attention between queries and lane features
+        x = self.layers[0].cross(queries, lane)
 
-        # 4. Run transformer encoder layers on the queries, using cross-attention
-        #    by concatenating queries and lane_feats, and then taking only the
-        #    query positions as the "latent array" (Perceiver-style).
-        #
-        #    input_seq: (B, n_waypoints + 2*n_track, d_model)
-        input_seq = torch.cat([queries, lane_feats], dim=1)
+        # (5) Remaining layers: self-attention over the waypoint latents
+        for layer in self.layers[1:]:
+            x = layer(x)
 
-        # We only care about the first n_waypoints positions after encoding
-        for layer in self.layers:
-            input_seq = layer(input_seq)
-
-        # 5. Take the first n_waypoints positions as the updated queries
-        #    shape: (B, n_waypoints, d_model)
-        updated_queries = input_seq[:, :self.n_waypoints, :]
-
-        # 6. Project to (x, y) for each waypoint
-        #    shape: (B, n_waypoints, 2)
-        out = self.output_head(updated_queries)
+        # (6) Project to (x, y) waypoints
+        out = self.output_head(x)  # (B, n_waypoints, 2)
         return out
 
 
+class CrossAttnBlock(nn.Module):
+    def __init__(self, d_model, n_heads, dim_ff):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, n_heads, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_ff),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim_ff, d_model)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def cross(self, query, lane):
+        attn_out, _ = self.cross_attn(query=query, key=lane, value=lane)
+        x = self.norm1(query + attn_out)
+        ff_out = self.ff(x)
+        x = self.norm2(x + ff_out)
+        return x
+
+
+class TransformerBlock(nn.Module):
+    """Self-attention block used after the cross-attention layer."""
+    def __init__(self, d_model, n_heads, dim_ff):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            d_model, n_heads, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_ff),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim_ff, d_model)
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        attn_out, _ = self.self_attn(x, x, x)
+        x = self.norm1(x + attn_out)
+        ff_out = self.ff(x)
+        x = self.norm2(x + ff_out)
+        return x
 
 class CNNPlanner(torch.nn.Module):
     def __init__(
