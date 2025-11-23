@@ -1,282 +1,207 @@
+"""
+Usage:
+    python3 -u -m homework.train_planner --epochs 20 --batch_size 64 --lr 1e-3 --data_root ./drive_data
+"""
+import argparse
 from pathlib import Path
-
+import random
+import numpy as np
 import torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, ConcatDataset
+from tqdm import tqdm
 
-HOMEWORK_DIR = Path(__file__).resolve().parent
-INPUT_MEAN = [0.2788, 0.2657, 0.2629]
-INPUT_STD = [0.2064, 0.1944, 0.2252]
+from homework.models import MODEL_FACTORY, save_model
+from homework.metrics import PlannerMetric
+from homework.datasets.road_dataset import RoadDataset
 
 
-class MLPPlanner(nn.Module):
-    def __init__(
-        self,
-        n_track: int = 10,
-        n_waypoints: int = 3,
-        hidden: int = 128,
-    ):
-        """
-        Args:
-            n_track (int): number of points in each side of the track
-            n_waypoints (int): number of waypoints to predict
-            hidden (int): hidden width of the MLP
-        """
-        super().__init__()
-        self.n_track = n_track
-        self.n_waypoints = n_waypoints
+def set_seed(seed: int = 1337):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-        in_dim = 4 * n_track          # left (n_track,2) + right (n_track,2) => 4*n_track scalars
-        out_dim = 2 * n_waypoints     # (x,y) for each waypoint
 
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, out_dim),
+def masked_l1_loss(preds, targets, mask):
+    """
+    Computes the masked L1 loss.
+    Args:
+        preds:   (B, n_waypoints, 2)
+        targets: (B, n_waypoints, 2)
+        mask:    (B, n_waypoints)  (bool or 0/1)
+    """
+    l1 = torch.abs(preds - targets)        # (B, n_waypoints, 2)
+    mask = mask.unsqueeze(-1).float()      # (B, n_waypoints, 1)
+    l1 = l1 * mask                         # zero-out invalid waypoints
+    valid = mask.sum()
+    loss = l1.sum() / (valid + 1e-8)
+    return loss
+
+
+def evaluate(model, loader, device):
+    """Evaluate model on the validation set using PlannerMetric."""
+    model.eval()
+    metric = PlannerMetric()
+
+    with torch.no_grad():
+        for batch in loader:
+            track_left = batch["track_left"].to(device)
+            track_right = batch["track_right"].to(device)
+            waypoints = batch["waypoints"].to(device)
+            waypoints_mask = batch["waypoints_mask"].to(device)
+
+            preds = model(track_left=track_left, track_right=track_right)
+            metric.add(preds, waypoints, waypoints_mask)
+
+    results = metric.compute()
+    return results
+
+
+def _episodes_under(split_dir: Path):
+    """
+    Return a list of episode directories under split_dir (those that contain info.npz).
+    Also supports the case where split_dir itself is a single episode dir with info.npz.
+    """
+    if (split_dir / "info.npz").exists():
+        return [split_dir]
+
+    eps = sorted([p for p in split_dir.iterdir() if (p / "info.npz").exists()])
+    return eps
+
+
+def _load_split_as_dataset(split_dir: Path):
+    """
+    Build a dataset for a split by concatenating per-episode RoadDataset instances.
+    If only a single episode exists, just return that dataset directly.
+    """
+    episodes = _episodes_under(split_dir)
+    if len(episodes) == 0:
+        raise FileNotFoundError(
+            f"No episodes found in {split_dir}. "
+            f"Expected subfolders like {split_dir}/000001/info.npz"
+        )
+    if len(episodes) == 1:
+        return RoadDataset(str(episodes[0])), 1
+
+    ds_list = [RoadDataset(str(ep)) for ep in episodes]
+    return ConcatDataset(ds_list), len(ds_list)
+
+def train(args):
+    set_seed(1337)
+    device = torch.device(args.device)
+    print(f"Using device: {device}")
+
+    # Resolve project root ( .../DSC394_Assignment4 )
+    ROOT = Path(__file__).resolve().parents[1]
+    data_root = (ROOT / args.data_root).resolve()
+    train_dir = data_root / "train"
+    val_dir = data_root / "val"
+
+    # Build datasets
+    train_ds, n_train_eps = _load_split_as_dataset(train_dir)
+    val_ds, n_val_eps = _load_split_as_dataset(val_dir)
+    print(f"Train episodes: {n_train_eps}, Val episodes: {n_val_eps}")
+    print(f"Train samples:  {len(train_ds)} | Val samples: {len(val_ds)}")
+
+    # DataLoader (num_workers=0 is safest in Colab for custom datasets)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+
+    # Model + optimizer
+    ModelCls = MODEL_FACTORY[args.model]
+
+    if args.model == "transformer_planner":
+        # GOOD CONFIG FOR THIS DATASET
+        model = ModelCls(
+            n_track=10,
+            n_waypoints=3,
+            d_model=64,
+            n_heads=4,
+            num_layers=2,
+            dim_ff=128,
+        ).to(device)
+
+        lr = args.lr if args.lr is not None else 2e-3
+
+    else:
+        model = ModelCls(n_track=10, n_waypoints=3).to(device)
+        lr = args.lr if args.lr is not None else 1e-3
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+
+    best_val_l1 = float("inf")
+    best_path = None
+
+    # Training loop
+    for epoch in range(1, args.epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_count = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
+        for batch in pbar:
+            track_left = batch["track_left"].to(device)          # (B, 10, 2)
+            track_right = batch["track_right"].to(device)        # (B, 10, 2)
+            waypoints = batch["waypoints"].to(device)            # (B, 3, 2)
+            waypoints_mask = batch["waypoints_mask"].to(device)  # (B, 3)
+
+            preds = model(track_left=track_left, track_right=track_right)
+            loss = masked_l1_loss(preds, waypoints, waypoints_mask)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * waypoints_mask.sum().item()
+            total_count += waypoints_mask.sum().item()
+
+            pbar.set_postfix({"train_L1": loss.item()})
+
+        train_loss = total_loss / max(total_count, 1)
+        print(f"Epoch {epoch}: avg train L1 = {train_loss:.4f}")
+
+        # Validation
+        val_metrics = evaluate(model, val_loader, device)
+        val_l1 = val_metrics["l1_error"]
+        print(
+            f"  [VAL] L1={val_l1:.4f}, "
+            f"Longitudinal={val_metrics['longitudinal_error']:.4f}, "
+            f"Lateral={val_metrics['lateral_error']:.4f}"
         )
 
-    def forward(
-        self,
-        track_left: torch.Tensor,
-        track_right: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Predicts waypoints from the left and right boundaries of the track.
-
-        During test time, your model will be called with
-        model(track_left=..., track_right=...), so keep the function signature as is.
-
-        Args:
-            track_left (torch.Tensor): shape (b, n_track, 2)
-            track_right (torch.Tensor): shape (b, n_track, 2)
-
-        Returns:
-            torch.Tensor: future waypoints with shape (b, n_waypoints, 2)
-        """
-        B = track_left.shape[0]
-        x_left = track_left.reshape(B, -1)    # (B, 2*n_track)
-        x_right = track_right.reshape(B, -1)  # (B, 2*n_track)
-        x = torch.cat([x_left, x_right], dim=-1)  # (B, 4*n_track)
-
-        out = self.net(x)                          # (B, 2*n_waypoints)
-        out = out.view(B, self.n_waypoints, 2)     # (B, n_waypoints, 2)
-        return out
-
-
-class TransformerPlanner(nn.Module):
-    def __init__(
-        self,
-        n_track: int = 10,
-        n_waypoints: int = 3,
-        d_model: int = 128,
-        n_heads: int = 8,
-        num_layers: int = 4,
-        dim_ff: int = 256,
-    ):
-        """
-        A Perceiver-style transformer that uses learned waypoint queries to attend
-        over the lane boundary points.
-
-        Args:
-            n_track (int): number of points per side of the track
-            n_waypoints (int): number of waypoints to predict
-            d_model (int): transformer embedding dimension
-            n_heads (int): number of attention heads
-            num_layers (int): number of cross-attention blocks
-            dim_ff (int): hidden size of the feed-forward networks
-        """
-        super().__init__()
-
-        self.n_track = n_track
-        self.n_waypoints = n_waypoints
-        self.d_model = d_model
-
-        # normalize coordinates slightly
-        self.input_norm = nn.LayerNorm(2)
-        self.norm_in = self.input_norm
-
-        # Embed each (x, y) lane point into d_model
-        self.track_proj = nn.Linear(2, d_model)
-        self.lane_proj = self.track_proj
-        # Positional embeddings for lane points (2 * n_track positions)
-        self.lane_pos_embed = nn.Embedding(2 * n_track, d_model)
-        # Learned query embeddings for each waypoint (the "latent array")
-        self.query_embed = nn.Embedding(n_waypoints, d_model)
-
-        # Cross-attention blocks
-        self.layers = nn.ModuleList([
-            CrossAttnBlock(d_model, n_heads, dim_ff),
-            *[
-                TransformerBlock(d_model, n_heads, dim_ff)
-                for _ in range(num_layers - 1)
-            ]
-        ])
-
-        # Final head: project each query embedding to (x, y) waypoint
-        self.output_head = nn.Linear(d_model, 2)
-
-    def forward(self, track_left, track_right, **kwargs):
-        B, n_track, _ = track_left.shape
-        assert n_track == self.n_track, f"Expected n_track={self.n_track}, got {n_track}"
-
-        # (1) Combine lane boundaries
-        lane = torch.cat([track_left, track_right], dim=1)
-        lane = self.input_norm(lane)
-        lane = self.track_proj(lane)
-
-        # add positional encodings
-        pos_idx = torch.arange(lane.size(1), device=lane.device)
-        lane = lane + self.lane_pos_embed(pos_idx)[None, :, :]
-
-        # (2) Build queries
-        queries = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
+    # Save model weights so the grader can load them
+    if val_l1 < best_val_l1:
+            best_val_l1 = val_l1
+            best_path = save_model(model)
+            print(f" Model saved to: {best_path}")
         
-        # (4) First layer: cross-attention between queries and lane features
-        x = self.layers[0].cross(queries, lane)
+    print(f"Best val L1={best_val_l1:.4f}, model at: {best_path}")
 
-        # (5) Remaining layers: self-attention over the waypoint latents
-        for layer in self.layers[1:]:
-            x = layer(x)
-
-        # (6) Project to (x, y) waypoints
-        out = self.output_head(x)  # (B, n_waypoints, 2)
-        return out
-
-
-class CrossAttnBlock(nn.Module):
-    def __init__(self, d_model, n_heads, dim_ff):
-        super().__init__()
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, n_heads, batch_first=True
-        )
-        self.norm1 = nn.LayerNorm(d_model)
-
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, dim_ff),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim_ff, d_model)
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-
-    def cross(self, query, lane):
-        attn_out, _ = self.cross_attn(query=query, key=lane, value=lane)
-        x = self.norm1(query + attn_out)
-        ff_out = self.ff(x)
-        x = self.norm2(x + ff_out)
-        return x
+def main():
+    parser = argparse.ArgumentParser(description="Train MLP Planner (Assignment 4 Part 1a)")
+    parser.add_argument("--epochs", type=int, default=20, help="number of training epochs")
+    parser.add_argument("--batch_size", type=int, default=64, help="batch size")
+    parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
+    parser.add_argument(
+        "--device", type=str,
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="device to use (cuda or cpu)"
+    )
+    parser.add_argument(
+        "--data_root", type=str, default="drive_data",
+        help="relative path (under project root) that contains train/ and val/ (e.g., ./drive_data)"
+    )
+    parser.add_argument(
+    "--model", type=str,
+    default="mlp_planner",
+    choices=["mlp_planner", "transformer_planner"],
+    help="which planner model to train"
+    )
+    args = parser.parse_args()
+    train(args)
 
 
-class TransformerBlock(nn.Module):
-    """Self-attention block used after the cross-attention layer."""
-    def __init__(self, d_model, n_heads, dim_ff):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(
-            d_model, n_heads, batch_first=True
-        )
-        self.norm1 = nn.LayerNorm(d_model)
+if __name__ == "__main__":
+    main()
 
-        self.ff = nn.Sequential(
-            nn.Linear(d_model, dim_ff),
-            nn.ReLU(inplace=True),
-            nn.Linear(dim_ff, d_model)
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        attn_out, _ = self.self_attn(x, x, x)
-        x = self.norm1(x + attn_out)
-        ff_out = self.ff(x)
-        x = self.norm2(x + ff_out)
-        return x
-
-class CNNPlanner(torch.nn.Module):
-    def __init__(
-        self,
-        n_waypoints: int = 3,
-    ):
-        super().__init__()
-
-        self.n_waypoints = n_waypoints
-
-        self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
-        self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
-
-    def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        Args:
-            image (torch.FloatTensor): shape (b, 3, h, w) and vals in [0, 1]
-
-        Returns:
-            torch.FloatTensor: future waypoints with shape (b, n, 2)
-        """
-        x = image
-        x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
-
-        raise NotImplementedError
-
-
-MODEL_FACTORY = {
-    "mlp_planner": MLPPlanner,
-    "transformer_planner": TransformerPlanner,
-    "cnn_planner": CNNPlanner,
-}
-
-
-def load_model(
-    model_name: str,
-    with_weights: bool = False,
-    **model_kwargs,
-) -> torch.nn.Module:
-    """
-    Called by the grader to load a pre-trained model by name
-    """
-    m = MODEL_FACTORY[model_name](**model_kwargs)
-
-    if with_weights:
-        model_path = HOMEWORK_DIR / f"{model_name}.th"
-        assert model_path.exists(), f"{model_path.name} not found"
-
-        try:
-            m.load_state_dict(torch.load(model_path, map_location="cpu"))
-        except RuntimeError as e:
-            raise AssertionError(
-                f"Failed to load {model_path.name}, make sure the default model arguments are set correctly"
-            ) from e
-
-    # limit model sizes since they will be zipped and submitted
-    model_size_mb = calculate_model_size_mb(m)
-
-    if model_size_mb > 20:
-        raise AssertionError(f"{model_name} is too large: {model_size_mb:.2f} MB")
-
-    return m
-
-
-def save_model(model: torch.nn.Module) -> str:
-    """
-    Use this function to save your model in train.py
-    """
-    model_name = None
-
-    for n, m in MODEL_FACTORY.items():
-        if type(model) is m:
-            model_name = n
-
-    if model_name is None:
-        raise ValueError(f"Model type '{str(type(model))}' not supported")
-
-    output_path = HOMEWORK_DIR / f"{model_name}.th"
-    torch.save(model.state_dict(), output_path)
-
-    return output_path
-
-
-def calculate_model_size_mb(model: torch.nn.Module) -> float:
-    """
-    Naive way to estimate model size
-    """
-    return sum(p.numel() for p in model.parameters()) * 4 / 1024 / 1024
