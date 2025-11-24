@@ -271,6 +271,41 @@ class CNNPlanner(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
 
+        # ------------------------------------------------------------------
+        # CNN backbone
+        # Input:  (B, 3, 96, 128)
+        # Output: (B, C, H', W') where we choose C=128, H'=6, W'=8
+        # ------------------------------------------------------------------
+        self.backbone = nn.Sequential(
+            # 96x128 -> 48x64
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+
+            # 48x64 -> 24x32
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+
+            # 24x32 -> 12x16
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+
+            # 12x16 -> 6x8
+            nn.Conv2d(128, 128, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+        # After backbone, feature shape is (B, 128, 6, 8) => 128 * 6 * 8 = 6144
+        feat_dim = 128 * 6 * 8
+
+        # ------------------------------------------------------------------
+        # MLP head: features -> (n_waypoints * 2) scalars, then reshape
+        # ------------------------------------------------------------------
+        self.head = nn.Sequential(
+            nn.Linear(feat_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, n_waypoints * 2),
+        )
+
     def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:
         """
         Args:
@@ -282,8 +317,18 @@ class CNNPlanner(torch.nn.Module):
         x = image
         x = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        raise NotImplementedError
+        # CNN backbone
+        x = self.backbone(x)          # (B, 128, 6, 8)
+        B = x.shape[0]
 
+        # Flatten spatial dimensions
+        x = x.view(B, -1)             # (B, 6144)
+
+        # MLP head to waypoints
+        x = self.head(x)              # (B, n_waypoints * 2)
+        x = x.view(B, self.n_waypoints, 2)  # (B, n_waypoints, 2)
+
+        return x
 
 MODEL_FACTORY = {
     "mlp_planner": MLPPlanner,
