@@ -78,15 +78,17 @@ class TransformerPlanner(nn.Module):
         dim_ff: int = 256,
     ):
         """
-        A Perceiver-style transformer that uses learned waypoint queries to attend
-        over the lane boundary points.
+        Perceiver-style planner:
+        - lane boundary points are encoded into a sequence of tokens;
+        - a small set of learned waypoint queries attend to them via cross-attention;
+        - optional self-attention layers refine the waypoint latents.
 
         Args:
             n_track (int): number of points per side of the track
             n_waypoints (int): number of waypoints to predict
             d_model (int): transformer embedding dimension
             n_heads (int): number of attention heads
-            num_layers (int): number of cross-attention blocks
+            num_layers (int): total number of blocks
             dim_ff (int): hidden size of the feed-forward networks
         """
         super().__init__()
@@ -95,102 +97,167 @@ class TransformerPlanner(nn.Module):
         self.n_waypoints = n_waypoints
         self.d_model = d_model
 
-        # normalize coordinates slightly
+        # normalize (x, y)
         self.input_norm = nn.LayerNorm(2)
-        self.norm_in = self.input_norm
 
-        # Embed each (x, y) lane point into d_model
+        # project each (x, y) lane point into d_model
         self.track_proj = nn.Linear(2, d_model)
-        self.lane_proj = self.track_proj
-        # Positional embeddings for lane points (2 * n_track positions)
-        self.lane_pos_embed = nn.Embedding(2 * n_track, d_model)
-        # Learned query embeddings for each waypoint (the "latent array")
-        self.query_embed = nn.Embedding(n_waypoints, d_model)
 
-        # Cross-attention blocks
-        self.layers = nn.ModuleList([
-            CrossAttnBlock(d_model, n_heads, dim_ff),
-            *[
+        # positional embeddings for lane points: indices 0..(2*n_track-1)
+        self.lane_pos_embed = nn.Embedding(2 * n_track, d_model)
+       
+        # learned base queries for waypoints
+        self.query_embed = nn.Embedding(n_waypoints, d_model)
+       
+        # deterministic sinusoidal positions for the waypoint queries
+        # registered as a buffer so it moves with to(device) but has no gradients
+        query_pos = self._build_sinusoidal_embeddings(n_waypoints, d_model)
+
+
+        self.register_buffer("query_pos_embed", query_pos, persistent=False)
+
+        # first block: cross-attention between queries and lane features
+        # remaining blocks: self-attention among waypoint latents
+        self.layers = nn.ModuleList(
+            [CrossAttnBlock(d_model, n_heads, dim_ff)]
+            + [
                 TransformerBlock(d_model, n_heads, dim_ff)
                 for _ in range(num_layers - 1)
             ]
-        ])
+        )
 
-        # Final head: project each query embedding to (x, y) waypoint
+        # final head: map each latent to (x, y)
         self.output_head = nn.Linear(d_model, 2)
 
+    @staticmethod
+    def _build_sinusoidal_embeddings(n: int, d: int) -> torch.Tensor:
+        """
+        Standard transformer-style sinusoidal positional embeddings.
+        Shape: (n, d)
+        """
+        pe = torch.zeros(n, d)
+        position = torch.arange(0, n, dtype=torch.float32).unsqueeze(1)    # (n, 1)
+        div_term = torch.exp(
+            torch.arange(0, d, 2, dtype=torch.float32) *
+            (-torch.log(torch.tensor(10000.0)) / d)
+        )  # (d/2,)
+
+        pe[:, 0::2] = torch.sin(position * div_term)  # even indices
+        pe[:, 1::2] = torch.cos(position * div_term)  # odd indices
+        return pe  # (n, d)
+
     def forward(self, track_left, track_right, **kwargs):
+        """
+        Args:
+            track_left:  (B, n_track, 2)
+            track_right: (B, n_track, 2)
+
+        Returns:
+            waypoints:   (B, n_waypoints, 2)
+        """
         B, n_track, _ = track_left.shape
         assert n_track == self.n_track, f"Expected n_track={self.n_track}, got {n_track}"
 
-        # (1) Combine lane boundaries
+        # (1) build lane token sequence: concat left/right
+        # lane: (B, 2*n_track, 2)
         lane = torch.cat([track_left, track_right], dim=1)
-        lane = self.track_proj(lane)
+        lane = self.track_proj(lane)           # (B, 2*n_track, d_model)
 
-        # add positional encodings
-        pos_idx = torch.arange(lane.size(1), device=lane.device)
-        lane = lane + self.lane_pos_embed(pos_idx)[None, :, :]
+        # (2) add lane positional embeddings
+        pos_idx = torch.arange(2 * self.n_track, device=lane.device)  # (2*n_track,)
+        lane_pos = self.lane_pos_embed(pos_idx)                       # (2*n_track, d_model)
+        lane = lane + lane_pos.unsqueeze(0)                           # (B, 2*n_track, d_model)
 
-        # (2) Build queries
-        queries = self.query_embed.weight.unsqueeze(0).expand(B, -1, -1)
-        
-        # (4) First layer: cross-attention between queries and lane features
-        x = self.layers[0].cross(queries, lane)
+        # (3) build query latents: learned base + fixed sinusoidal offsets
+        # query_embed.weight: (n_waypoints, d_model)
+        # query_pos_embed:    (n_waypoints, d_model)
+        queries = self.query_embed.weight + self.query_pos_embed
+        queries = queries.unsqueeze(0).expand(B, -1, -1)                    # (B, n_waypoints, d_model)            # (B, n_waypoints, d_model)
 
-        # (5) Remaining layers: self-attention over the waypoint latents
+        # (4) first layer: cross-attention to pull info from lane tokens
+        x = self.layers[0].cross(queries, lane)                       # (B, n_waypoints, d_model)
+
+        # (5) subsequent layers: self-attention over waypoint latents
         for layer in self.layers[1:]:
-            x = layer(x)
+            x = layer(x)                                              # (B, n_waypoints, d_model)
 
-        # (6) Project to (x, y) waypoints
-        out = self.output_head(x)  # (B, n_waypoints, 2)
+        # (6) predict (x, y) for each waypoint latent
+        out = self.output_head(x)                                     # (B, n_waypoints, 2)
         return out
 
 
 class CrossAttnBlock(nn.Module):
+    """
+    One cross-attention + feed-forward block:
+
+      queries ----> Q
+      lane_feats -> K, V
+
+    Output has the same shape as queries.
+    """
+
     def __init__(self, d_model, n_heads, dim_ff):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(
-            d_model, n_heads, batch_first=True
+            embed_dim=d_model,
+            num_heads=n_heads,
+            batch_first=True,
         )
         self.norm1 = nn.LayerNorm(d_model)
 
         self.ff = nn.Sequential(
             nn.Linear(d_model, dim_ff),
             nn.ReLU(inplace=True),
-            nn.Linear(dim_ff, d_model)
+            nn.Linear(dim_ff, d_model),
         )
         self.norm2 = nn.LayerNorm(d_model)
 
     def cross(self, query, lane):
+        """
+        Args:
+            query: (B, n_waypoints, d_model)
+            lane:  (B, 2*n_track, d_model)
+        """
         attn_out, _ = self.cross_attn(query=query, key=lane, value=lane)
-        x = self.norm1(query + attn_out)
+        x = self.norm1(query + attn_out)   # residual + norm
+
         ff_out = self.ff(x)
-        x = self.norm2(x + ff_out)
+        x = self.norm2(x + ff_out)         # residual + norm
         return x
 
 
 class TransformerBlock(nn.Module):
-    """Self-attention block used after the cross-attention layer."""
+    """
+    Standard transformer block with self-attention over the waypoint latents.
+    """
+
     def __init__(self, d_model, n_heads, dim_ff):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(
-            d_model, n_heads, batch_first=True
+            embed_dim=d_model,
+            num_heads=n_heads,
+            batch_first=True,
         )
         self.norm1 = nn.LayerNorm(d_model)
 
         self.ff = nn.Sequential(
             nn.Linear(d_model, dim_ff),
             nn.ReLU(inplace=True),
-            nn.Linear(dim_ff, d_model)
+            nn.Linear(dim_ff, d_model),
         )
         self.norm2 = nn.LayerNorm(d_model)
 
     def forward(self, x):
+        """
+        x: (B, n_waypoints, d_model)
+        """
         attn_out, _ = self.self_attn(x, x, x)
         x = self.norm1(x + attn_out)
+
         ff_out = self.ff(x)
         x = self.norm2(x + ff_out)
         return x
+
 
 class CNNPlanner(torch.nn.Module):
     def __init__(
