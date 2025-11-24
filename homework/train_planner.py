@@ -1,7 +1,10 @@
 """
 Usage:
-    python3 -u -m homework.train_planner --epochs 20 --batch_size 64 --lr 1e-3 --data_root ./drive_data
+    python3 -u -m homework.train_planner \
+        --model mlp_planner \
+        --epochs 20 --batch_size 64 --lr 1e-3 --data_root ./drive_data
 """
+
 import argparse
 from pathlib import Path
 import random
@@ -39,19 +42,26 @@ def masked_l1_loss(preds, targets, mask):
     return loss
 
 
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, model_name: str):
     """Evaluate model on the validation set using PlannerMetric."""
     model.eval()
     metric = PlannerMetric()
 
     with torch.no_grad():
         for batch in loader:
-            track_left = batch["track_left"].to(device)
-            track_right = batch["track_right"].to(device)
-            waypoints = batch["waypoints"].to(device)
+            waypoints = batch["waypoints"].to(device)        # (B, n_waypoints, 2)
             waypoints_mask = batch["waypoints_mask"].to(device)
 
-            preds = model(track_left=track_left, track_right=track_right)
+            if model_name == "cnn_planner":
+                # CNNPlanner uses only the image as input
+                images = batch["image"].to(device)           # (B, 3, 96, 128)
+                preds = model(image=images)
+            else:
+                # MLP and Transformer planners use lane boundaries
+                track_left = batch["track_left"].to(device)   # (B, n_track, 2)
+                track_right = batch["track_right"].to(device) # (B, n_track, 2)
+                preds = model(track_left=track_left, track_right=track_right)
+
             metric.add(preds, waypoints, waypoints_mask)
 
     results = metric.compute()
@@ -87,6 +97,7 @@ def _load_split_as_dataset(split_dir: Path):
     ds_list = [RoadDataset(str(ep)) for ep in episodes]
     return ConcatDataset(ds_list), len(ds_list)
 
+
 def train(args):
     set_seed(1337)
     device = torch.device(args.device)
@@ -105,30 +116,21 @@ def train(args):
     print(f"Train samples:  {len(train_ds)} | Val samples: {len(val_ds)}")
 
     # DataLoader (num_workers=0 is safest in Colab for custom datasets)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
+                              shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size,
+                            shuffle=False, num_workers=0)
 
     # Model + optimizer
     ModelCls = MODEL_FACTORY[args.model]
 
-    if args.model == "transformer_planner":
-        # GOOD CONFIG FOR THIS DATASET
-        model = ModelCls(
-            n_track=10,
-            n_waypoints=3,
-            d_model=64,
-            n_heads=4,
-            num_layers=2,
-            dim_ff=128,
-        ).to(device)
-
-        lr = args.lr if args.lr is not None else 2e-3
-
+    # For all planners we keep n_track=10, n_waypoints=3 so grader can load defaults
+    if args.model == "cnn_planner":
+        model = ModelCls(n_waypoints=3).to(device)
     else:
         model = ModelCls(n_track=10, n_waypoints=3).to(device)
-        lr = args.lr if args.lr is not None else 1e-3
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     best_val_l1 = float("inf")
     best_path = None
@@ -141,18 +143,24 @@ def train(args):
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
         for batch in pbar:
-            track_left = batch["track_left"].to(device)          # (B, 10, 2)
-            track_right = batch["track_right"].to(device)        # (B, 10, 2)
-            waypoints = batch["waypoints"].to(device)            # (B, 3, 2)
+            waypoints = batch["waypoints"].to(device)          # (B, 3, 2)
             waypoints_mask = batch["waypoints_mask"].to(device)  # (B, 3)
 
-            preds = model(track_left=track_left, track_right=track_right)
+            if args.model == "cnn_planner":
+                images = batch["image"].to(device)              # (B, 3, 96, 128)
+                preds = model(image=images)
+            else:
+                track_left = batch["track_left"].to(device)     # (B, 10, 2)
+                track_right = batch["track_right"].to(device)   # (B, 10, 2)
+                preds = model(track_left=track_left, track_right=track_right)
+
             loss = masked_l1_loss(preds, waypoints, waypoints_mask)
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
+            # accumulate for epoch average
             total_loss += loss.item() * waypoints_mask.sum().item()
             total_count += waypoints_mask.sum().item()
 
@@ -162,7 +170,7 @@ def train(args):
         print(f"Epoch {epoch}: avg train L1 = {train_loss:.4f}")
 
         # Validation
-        val_metrics = evaluate(model, val_loader, device)
+        val_metrics = evaluate(model, val_loader, device, args.model)
         val_l1 = val_metrics["l1_error"]
         print(
             f"  [VAL] L1={val_l1:.4f}, "
@@ -170,16 +178,17 @@ def train(args):
             f"Lateral={val_metrics['lateral_error']:.4f}"
         )
 
-    # Save model weights so the grader can load them
-    if val_l1 < best_val_l1:
+        # Save best model so grader can load it later
+        if val_l1 < best_val_l1:
             best_val_l1 = val_l1
             best_path = save_model(model)
-            print(f" Model saved to: {best_path}")
-        
+            print(f"  Model saved to: {best_path}")
+
     print(f"Best val L1={best_val_l1:.4f}, model at: {best_path}")
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Train MLP Planner (Assignment 4 Part 1a)")
+    parser = argparse.ArgumentParser(description="Train Planner Models")
     parser.add_argument("--epochs", type=int, default=20, help="number of training epochs")
     parser.add_argument("--batch_size", type=int, default=64, help="batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="learning rate")
@@ -190,13 +199,13 @@ def main():
     )
     parser.add_argument(
         "--data_root", type=str, default="drive_data",
-        help="relative path (under project root) that contains train/ and val/ (e.g., ./drive_data)"
+        help="relative path (under project root) that contains train/ and val/"
     )
     parser.add_argument(
-    "--model", type=str,
-    default="mlp_planner",
-    choices=["mlp_planner", "transformer_planner"],
-    help="which planner model to train"
+        "--model", type=str,
+        default="mlp_planner",
+        choices=["mlp_planner", "transformer_planner", "cnn_planner"],
+        help="which planner model to train"
     )
     args = parser.parse_args()
     train(args)
@@ -204,4 +213,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
