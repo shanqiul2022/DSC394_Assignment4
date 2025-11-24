@@ -72,10 +72,10 @@ class TransformerPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        d_model: int = 128,
-        n_heads: int = 8,
-        num_layers: int = 4,
-        dim_ff: int = 256,
+        d_model: int = 64,
+        n_heads: int = 4,
+        num_layers: int = 2,
+        dim_ff: int = 128,
     ):
         """
         Perceiver-style planner:
